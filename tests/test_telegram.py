@@ -1,6 +1,7 @@
 """Tests for TelegramChannel adapter and event handlers."""
 
-from unittest.mock import AsyncMock, MagicMock
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -8,6 +9,8 @@ from chatflow_agent.channels.telegram import TelegramChannel
 from chatflow_agent.core.agent import Agent
 from chatflow_agent.core.engine import EngineTurnResult, GeminiEngine
 from chatflow_agent.core.runner import Runner
+from chatflow_agent.exceptions import DependencyError
+from chatflow_agent.types import Role
 
 
 class MockEngine(GeminiEngine):
@@ -237,3 +240,89 @@ async def test_telegram_reset_fail_closed_on_api_error(
         "Only group admins can reset the conversation."
     )
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("synthetic failure"), TimeoutError("timeout")])
+async def test_runner_error_replies_with_configured_fallback(
+    telegram_channel: TelegramChannel, error: Exception
+) -> None:
+    update = MagicMock(effective_chat=MagicMock(id=101))
+    update.message = AsyncMock(text="hello")
+    context = MagicMock(bot=AsyncMock())
+    telegram_channel.fallback_message = "Please try again later."
+    with patch.object(telegram_channel, "dispatch_async", new=AsyncMock(side_effect=error)) as dispatch:
+        await telegram_channel._handle_message(update, context)
+    dispatch.assert_awaited_once()
+    update.message.reply_text.assert_awaited_once_with(telegram_channel.fallback_message)
+
+
+@pytest.mark.asyncio
+async def test_typing_failure_does_not_prevent_dispatch(
+    telegram_channel: TelegramChannel,
+) -> None:
+    update = MagicMock(effective_chat=MagicMock(id=102), effective_user=None)
+    update.message = AsyncMock(text="hello")
+    context = MagicMock(bot=AsyncMock())
+    context.bot.send_chat_action.side_effect = RuntimeError("synthetic typing failure")
+    with patch.object(telegram_channel, "dispatch_async", wraps=telegram_channel.dispatch_async) as dispatch:
+        await telegram_channel._handle_message(update, context)
+    dispatch.assert_awaited_once_with(
+        session_id="102", message="hello",
+        metadata={"channel": "telegram", "chat_id": "102", "username": None},
+    )
+    context.bot.send_chat_action.assert_awaited_once()
+    update.message.reply_text.assert_awaited_once_with("Telegram answer from ChatFlow!")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["chat", "message", "text", "empty_text"])
+async def test_non_text_update_is_ignored(
+    telegram_channel: TelegramChannel, missing: str
+) -> None:
+    update = MagicMock(effective_chat=MagicMock(id=103))
+    message = AsyncMock(text="hello")
+    update.message = message
+    if missing == "chat":
+        update.effective_chat = None
+    elif missing == "message":
+        update.message = None
+    else:
+        message.text = None if missing == "text" else ""
+    context = MagicMock(bot=AsyncMock())
+    with patch.object(telegram_channel, "dispatch_async", new=AsyncMock()) as dispatch:
+        await telegram_channel._handle_message(update, context)
+    dispatch.assert_not_awaited()
+    context.bot.send_chat_action.assert_not_awaited()
+    message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.parametrize("module", ["telegram", "telegram.constants", "telegram.ext"])
+def test_missing_telegram_dependency_reports_install_extra(module: str) -> None:
+    with patch.dict(sys.modules, {module: None}), pytest.raises(DependencyError) as caught:
+        TelegramChannel(token="synthetic-token")
+    assert caught.value.feature == "TelegramChannel"
+    assert caught.value.extra_package == "telegram"
+    assert isinstance(caught.value.__cause__, ImportError)
+    assert 'pip install "chatflow-agent[telegram]"' in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_distinct_chats_keep_separate_session_history(
+    telegram_channel: TelegramChannel,
+) -> None:
+    context = MagicMock(bot=AsyncMock())
+    for chat_id, text in [(201, "first chat"), (202, "second chat"), (201, "first again")]:
+        update = MagicMock(effective_chat=MagicMock(id=chat_id), effective_user=None)
+        update.message = AsyncMock(text=text)
+        await telegram_channel._handle_message(update, context)
+        update.message.reply_text.assert_awaited_once_with("Telegram answer from ChatFlow!")
+    runner = telegram_channel.runner
+    assert runner is not None
+    first = runner.get_session("201")
+    second = runner.get_session("202")
+    assert first is not None and second is not None and first is not second
+    assert [m.content for m in first.history if m.role == Role.USER] == ["first chat", "first again"]
+    assert [m.content for m in second.history if m.role == Role.USER] == ["second chat"]
+    assert first.metadata["chat_id"] == "201"
+    assert second.metadata["chat_id"] == "202"
